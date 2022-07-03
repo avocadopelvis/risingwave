@@ -105,6 +105,11 @@ impl TableFragments {
         self.actor_status = actor_status;
     }
 
+    /// get the actor locations.
+    pub fn get_actor_status(&self) -> BTreeMap<ActorId, ActorStatus> {
+        self.actor_status.clone()
+    }
+
     /// Returns the table id.
     pub fn table_id(&self) -> TableId {
         self.table_id

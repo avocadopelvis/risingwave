@@ -21,15 +21,15 @@ use risingwave_common::catalog::TableId;
 use risingwave_common::error::Result;
 use risingwave_common::types::{ParallelUnitId, VIRTUAL_NODE_COUNT};
 use risingwave_pb::catalog::{Source, Table};
+
 use risingwave_pb::common::{ActorInfo, ParallelUnitMapping, WorkerType};
 use risingwave_pb::catalog::Source;
+
 use risingwave_pb::common::{ActorInfo, ParallelUnitMapping, WorkerNode, WorkerType};
 use risingwave_pb::meta::table_fragments::{ActorState, ActorStatus};
 use risingwave_pb::stream_plan::stream_node::NodeBody;
 use risingwave_pb::stream_plan::{ActorMapping, DispatcherType, StreamNode};
-use risingwave_pb::stream_service::{
-    BroadcastActorInfoTableRequest, BuildActorsRequest, HangingChannel, UpdateActorsRequest,
-};
+use risingwave_pb::stream_service::{BroadcastActorInfoTableRequest, BuildActorsRequest, DropActorsRequest, HangingChannel, UpdateActorsRequest};
 use risingwave_rpc_client::StreamClientPoolRef;
 use uuid::Uuid;
 
@@ -263,28 +263,6 @@ impl<S> GlobalStreamManager<S>
             }
         }
         Ok(())
-    }
-
-    pub async fn migrate_actor(&self, actor_map: HashMap<TableId, HashMap<ActorId, WorkerNode>>) -> Result<()> {
-        let table_ids = actor_map.keys().collect();
-        let node_actors = self.fragment_manager.get_tables_node_actors(&table_ids).await?;
-
-        for (table_id, actors) in actor_map {
-            let table_node_actors = node_actors.get(&table_id).unwrap();
-
-            let mut actors_node = HashMap::new();
-            for (worker_id, actor_ids) in table_node_actors {
-                actors_node.extend(actor_ids.into_iter().map(|actor_id| (*actor_id, *worker_id)))
-            }
-
-            // for (actor_id, worker_id) in actors {
-            //
-            // }
-        }
-
-        self.barrier_manager.run_command(Command::Plain())
-
-        todo!()
     }
 
     /// Create materialized view, it works as follows:
@@ -660,6 +638,133 @@ impl<S> GlobalStreamManager<S>
         revert_funcs.clear();
         Ok(())
     }
+
+    pub async fn migrate_actor(&self, table_id: TableId, actor_id: ActorId, node_id: WorkerId) -> Result<()> {
+        let table_fragments = self.fragment_manager.select_table_fragments_by_table_id(&table_id).await?;
+        let actor_status = table_fragments.get_actor_status();
+        let actor_map = table_fragments.actor_map();
+        let stream_actor = actor_map.get(&actor_id).cloned().unwrap();
+        let new_stream_actor = stream_actor.clone();
+        let upstream_actor_ids = stream_actor.upstream_actor_id.clone();
+        let dispatcher = stream_actor.dispatcher.clone();
+
+        let status = actor_status.get(&actor_id).unwrap();
+        let prev_node_id = status.parallel_unit.as_ref().unwrap().clone().worker_node_id;
+
+        let node = self.cluster_manager.get_worker_by_id(node_id).await.unwrap().worker_node;
+
+        let client = self.client_pool.get(&node).await?;
+
+        let request_id = Uuid::new_v4().to_string();
+                client
+            .to_owned()
+            .update_actors(UpdateActorsRequest {
+                request_id,
+                actors: vec![new_stream_actor],
+                hanging_channels: vec![],//node_hanging_channels.remove(node_id).unwrap_or_default(),
+            })
+            .await?;
+
+        let request_id = Uuid::new_v4().to_string();
+        client
+            .to_owned()
+            .build_actors(BuildActorsRequest {
+                request_id,
+                actor_id: vec![actor_id],
+            })
+            .await?;
+
+        todo!()
+    }
+
+    //
+    // pub async fn migrate_actors(&self, table_id: TableId, targets: HashMap<ActorId, WorkerId>) -> Result<()> {
+    //     let table_fragments = self.fragment_manager.select_table_fragments_by_table_id(&table_id).await?;
+    //     let actor_status = table_fragments.get_actor_status();
+    //     let actor_map = table_fragments.actor_map();
+    //
+    //     let chain_actor_ids = HashSet::from_iter(table_fragments.chain_actor_ids().into_iter());
+    //
+    //     for actor_id in targets.keys() {
+    //         let stream_actor = actor_map.get(actor_id).cloned().unwrap();
+    //
+    //         if chain_actor_ids.contains(actor_id) {
+    //             let _upstream_actor_id = stream_actor.upstream_actor_id;
+    //         }
+    //
+    //         // todo fetch chain
+    //     }
+    //
+    //     let nodes = self
+    //         .cluster_manager
+    //         .list_worker_node(
+    //             WorkerType::ComputeNode,
+    //             Some(risingwave_pb::common::worker_node::State::Running),
+    //         )
+    //         .await;
+    //     if nodes.is_empty() {
+    //         return Err(internal_error("no available compute node in the cluster"));
+    //     }
+    //
+    //     let actor_locations = actor_status.into_iter().map(|(actor_id, actor_status)| {
+    //         let parallel_unit = actor_status.parallel_unit.unwrap();
+    //         (actor_id, parallel_unit)
+    //     }).collect();
+    //
+    //     let mut locations = ScheduledLocations::new();
+    //     locations.node_locations = nodes.into_iter().map(|node| (node.id, node)).collect();
+    //     locations.actor_locations = actor_locations;
+    //
+    //     let actor_host_infos = locations.actor_info_map();
+    //
+    //     let mut dispatches: HashMap<(ActorId, DispatcherId), Vec<ActorInfo>> = HashMap::new();
+    //
+    //     for actor_id in targets.keys() {
+    //         let stream_actor = actor_map.get(actor_id).cloned().unwrap();
+    //
+    //         for dispatcher in stream_actor.dispatcher {
+    //             dispatches.insert((actor_id.clone(), dispatcher.dispatcher_id), dispatcher.downstream_actor_id.into_iter().map(|actor_id| actor_host_infos.get(&actor_id).cloned().unwrap()).collect());
+    //         }
+    //     }
+    //
+    //     let up_id_to_down_info = dispatches
+    //         .iter()
+    //         .map(|((up_id, _), down_info)| (*up_id, down_info.clone()))
+    //         .collect::<HashMap<_, _>>();
+    //
+    //
+    //     for (actor_id, node_id) in targets.iter() {
+    //         let node = locations.node_locations.get(node_id).unwrap();
+    //
+    //         let client = self.client_pool.get(node).await?;
+    //
+    //         client
+    //             .to_owned()
+    //             .broadcast_actor_info_table(BroadcastActorInfoTableRequest {
+    //                 info: actor_infos_to_broadcast.clone(),
+    //             })
+    //             .await?;
+    //
+    //         let stream_actors = actors
+    //             .iter()
+    //             .map(|actor_id| actor_map.get(actor_id).cloned().unwrap())
+    //             .collect::<Vec<_>>();
+    //
+    //         let request_id = Uuid::new_v4().to_string();
+    //         tracing::debug!(request_id = request_id.as_str(), actors = ?actors, "update actors");
+    //         client
+    //             .to_owned()
+    //             .update_actors(UpdateActorsRequest {
+    //                 request_id,
+    //                 actors: stream_actors.clone(),
+    //                 hanging_channels: node_hanging_channels.remove(node_id).unwrap_or_default(),
+    //             })
+    //             .await?;
+    //     }
+    //
+    //
+    //     todo!()
+    // }
 
     /// Dropping materialized view is done by barrier manager. Check
     /// [`Command::DropMaterializedView`] for details.
@@ -1066,6 +1171,111 @@ mod tests {
             .await?;
         assert_eq!(sink_actor_ids, (0..5).collect::<Vec<u32>>());
         assert_eq!(actor_ids, (0..5).collect::<Vec<u32>>());
+
+        services.stop().await;
+        Ok(())
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_migrate_actor() -> Result<()> {
+        let services = MockServices::start("127.0.0.1", 12333).await?;
+
+        let table_ref_id = TableRefId {
+            schema_ref_id: None,
+            table_id: 0,
+        };
+        let table_id = TableId::from(&Some(table_ref_id.clone()));
+
+        let actors = (0..5)
+            .map(|i| StreamActor {
+                actor_id: i,
+                // A dummy node to avoid panic.
+                nodes: Some(risingwave_pb::stream_plan::StreamNode {
+                    node_body: Some(
+                        risingwave_pb::stream_plan::stream_node::NodeBody::Materialize(
+                            risingwave_pb::stream_plan::MaterializeNode {
+                                table_ref_id: Some(table_ref_id.clone()),
+                                ..Default::default()
+                            },
+                        ),
+                    ),
+                    operator_id: 1,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+
+        let mut fragments = BTreeMap::default();
+        fragments.insert(
+            0,
+            Fragment {
+                fragment_id: 0,
+                fragment_type: FragmentType::Sink as i32,
+                distribution_type: FragmentDistributionType::Hash as i32,
+                actors: actors.clone(),
+                vnode_mapping: None,
+            },
+        );
+        let table_fragments = TableFragments::new(table_id, fragments, HashSet::default());
+
+        let ctx = CreateMaterializedViewContext::default();
+
+        services
+            .global_stream_manager
+            .create_materialized_view(table_fragments, ctx)
+            .await?;
+
+
+        let x= services.global_stream_manager.fragment_manager.select_table_fragments_by_table_id(&table_id).await.unwrap();
+
+        for xx in x.get_actor_status() {
+            println!("{} -> {}", xx.0, xx.1.parallel_unit.unwrap().worker_node_id);
+        }
+
+        // for actor in actors {
+        //     let mut scheduled_actor = services
+        //         .state
+        //         .actor_streams
+        //         .lock()
+        //         .unwrap()
+        //         .get(&actor.get_actor_id())
+        //         .cloned()
+        //         .unwrap()
+        //         .clone();
+        //     scheduled_actor.vnode_bitmap.take().unwrap();
+        //     assert_eq!(scheduled_actor, actor);
+        //     assert!(services
+        //         .state
+        //         .actor_ids
+        //         .lock()
+        //         .unwrap()
+        //         .contains(&actor.get_actor_id()));
+        //     assert_eq!(
+        //         services
+        //             .state
+        //             .actor_infos
+        //             .lock()
+        //             .unwrap()
+        //             .get(&actor.get_actor_id())
+        //             .cloned()
+        //             .unwrap(),
+        //         HostAddress {
+        //             host: "127.0.0.1".to_string(),
+        //             port: 12333,
+        //         }
+        //     );
+        // }
+        //
+        // let sink_actor_ids = services
+        //     .fragment_manager
+        //     .get_table_sink_actor_ids(&table_id)
+        //     .await?;
+        // let actor_ids = services
+        //     .fragment_manager
+        //     .get_table_actor_ids(&table_id)
+        //     .await?;
+        // assert_eq!(sink_actor_ids, (0..5).collect::<Vec<u32>>());
+        // assert_eq!(actor_ids, (0..5).collect::<Vec<u32>>());
 
         services.stop().await;
         Ok(())
