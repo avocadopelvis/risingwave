@@ -35,7 +35,7 @@ use risingwave_pb::stream_plan::barrier::Mutation as ProstMutation;
 use risingwave_pb::stream_plan::stream_message::StreamMessage;
 use risingwave_pb::stream_plan::{
     AddDispatcherMutation, AddMutation, Barrier as ProstBarrier, Dispatcher as ProstDispatcher,
-    DispatcherMutation, SourceChangeSplitMutation, StopMutation,
+    DispatcherMutation, PauseMutation, ResumeMutation, SourceChangeSplitMutation, StopMutation,
     StreamMessage as ProstStreamMessage, UpdateMutation,
 };
 use smallvec::SmallVec;
@@ -192,6 +192,8 @@ pub enum Mutation {
     AddOutput(AddOutput),
     AddDispatcher(AddDispatcher),
     SourceChangeSplit(HashMap<ActorId, ConnectorState>),
+    Pause,
+    Resume,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -374,6 +376,8 @@ impl Mutation {
                         .collect(),
                 })
             }
+            Mutation::Pause => ProstMutation::Pause(PauseMutation {}),
+            Mutation::Resume => ProstMutation::Resume(ResumeMutation {}),
         }
     }
 
@@ -472,6 +476,8 @@ impl Mutation {
                         .collect::<HashMap<ActorId, ConnectorState>>(),
                 )
             }
+            ProstMutation::Pause(_) => Mutation::Pause,
+            ProstMutation::Resume(_) => Mutation::Resume,
         };
         Ok(mutation)
     }
