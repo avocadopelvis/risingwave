@@ -239,18 +239,14 @@ where
             };
             // Initialize independent levels via corresponding compaction group' config.
             for compaction_group in self.compaction_group_manager.compaction_groups().await {
-                let mut levels = vec![Level {
-                    level_idx: 0u32,
-                    level_type: LevelType::Overlapping as i32,
-                    table_infos: vec![],
-                    total_file_size: 0,
-                }];
+                let mut levels = vec![];
                 for l in 0..compaction_group.compaction_config().max_level {
                     levels.push(Level {
                         level_idx: (l + 1) as u32,
                         level_type: LevelType::Nonoverlapping as i32,
                         table_infos: vec![],
                         total_file_size: 0,
+                        sub_level_id: 0,
                     });
                 }
                 init_version.levels.insert(
@@ -279,7 +275,7 @@ where
                     let mut delete_sst_levels = Vec::with_capacity(level_deltas.level_deltas.len());
                     let mut delete_sst_ids_set = HashSet::new();
                     let mut insert_sst_level = usize::MAX;
-                    let mut insert_sub_level = usize::MAX;
+                    let mut insert_sub_level = u64::MAX;
                     let mut insert_table_infos = vec![];
                     for level_delta in &level_deltas.level_deltas {
                         if !level_delta.removed_table_ids.is_empty() {
@@ -288,7 +284,7 @@ where
                         }
                         if !level_delta.inserted_table_infos.is_empty() {
                             insert_sst_level = level_delta.level_idx as usize;
-                            insert_sub_level = level_delta.l0_sub_level_idx as usize;
+                            insert_sub_level = level_delta.l0_sub_level_id;
                             insert_table_infos
                                 .extend(level_delta.inserted_table_infos.iter().cloned());
                         }
@@ -598,6 +594,7 @@ where
             compaction_group_id,
             manual_compaction_option,
         );
+        tracing::warn!("get_compact_task_impl exist: {}", compact_task.is_some());
 
         let ret = match compact_task {
             None => Ok(None),
@@ -659,32 +656,25 @@ where
                     compact_status.compaction_config.compaction_filter_mask;
 
                 commit_multi_var!(self, None, compact_status)?;
-                current_version
-                    .get_compaction_group_levels(compaction_group_id)
-                    .levels[compact_task.input_ssts[0].level_idx as usize]
-                    .table_infos
-                    .len();
-                let mut total_table_count = 0;
-                for input_level in &compact_task.input_ssts {
-                    current_version.iter_tables(
-                        compaction_group_id,
-                        input_level.level_idx as usize,
-                        |_| {
-                            total_table_count += 1;
-                        },
-                    );
-                }
                 tracing::trace!(
-                    "For compaction group {}: pick up {} tables in level {} to compact. The number of total tables of input level is {}. cost time: {:?}",
+                    "For compaction group {}: pick up {} tables in level {} to compact.  cost time: {:?}",
                     compaction_group_id,
                     compact_task.input_ssts[0].table_infos.len(),
                     compact_task.input_ssts[0].level_idx,
-                    total_table_count,
                     start_time.elapsed()
                 );
                 Ok(Some(compact_task))
             }
         };
+        trigger_sst_stat(
+            &self.metrics,
+            compaction
+                .compaction_statuses
+                .get(&compaction_group_id)
+                .ok_or(Error::InvalidCompactionGroup(compaction_group_id))?,
+            &current_version,
+            compaction_group_id,
+        );
 
         #[cfg(test)]
         {
@@ -817,6 +807,7 @@ where
             let level_delta = LevelDelta {
                 level_idx: compact_task.target_level,
                 inserted_table_infos: compact_task.sorted_output_ssts.clone(),
+                l0_sub_level_id: compact_task.target_sub_level_id,
                 ..Default::default()
             };
             level_deltas.push(level_delta);
@@ -1002,19 +993,24 @@ where
             let level_delta = LevelDelta {
                 level_idx: 0,
                 inserted_table_infos: group_sstables.clone(),
-                l0_sub_level_idx: version_l0.sub_levels.len() as u32,
+                l0_sub_level_id: group_sstables[0].id,
                 ..Default::default()
             };
 
-            version_l0.sub_levels.push(Level {
+            // All files will be committed in one new Overlapping sub-level and become
+            // Nonoverlapping  after at least one compaction.
+            let level = Level {
                 level_type: LevelType::Overlapping as i32,
-                level_idx: level_delta.l0_sub_level_idx,
+                level_idx: 0,
                 total_file_size: group_sstables
                     .iter()
                     .map(|table| table.file_size)
                     .sum::<u64>(),
                 table_infos: group_sstables,
-            });
+                sub_level_id: level_delta.l0_sub_level_id,
+            };
+            version_l0.total_file_size += level.total_file_size;
+            version_l0.sub_levels.push(level);
             level_deltas.push(level_delta);
         }
 
@@ -1336,11 +1332,16 @@ where
                         .flat_map(|(_, l)| &l.levels)
                         .flat_map(|level| {
                             level.table_infos.iter().map(|table_info| {
-                                versioning_guard
-                                    .sstable_id_infos
-                                    .get(&table_info.id)
-                                    .unwrap()
-                                    .clone()
+                                let info = versioning_guard.sstable_id_infos.get(&table_info.id);
+                                if info.is_none() {
+                                    tracing::error!(
+                                        "sst {} in level {}, sub-level: {} not exist",
+                                        table_info.id,
+                                        level.level_idx,
+                                        level.sub_level_id
+                                    );
+                                }
+                                info.unwrap().clone()
                             })
                         })
                         .collect_vec()

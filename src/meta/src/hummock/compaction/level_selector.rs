@@ -19,6 +19,7 @@
 
 use std::sync::Arc;
 
+use itertools::Itertools;
 use risingwave_hummock_sdk::HummockCompactionTaskId;
 use risingwave_pb::hummock::hummock_version::Levels;
 use risingwave_pb::hummock::CompactionConfig;
@@ -110,7 +111,6 @@ impl DynamicLevelSelector {
                 Box::new(LevelCompactionPicker::new(
                     task_id,
                     target_level,
-                    self.config.clone(),
                     self.overlap_strategy.clone(),
                 ))
             }
