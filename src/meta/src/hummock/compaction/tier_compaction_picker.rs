@@ -131,7 +131,7 @@ impl TierCompactionPicker {
     ) -> Option<CompactionInput> {
         // do not pick the first sub-level because we do not want to block the level compaction.
         for (idx, level) in l0.sub_levels.iter().enumerate() {
-            if level.level_idx == 0
+            if idx == 0
                 || level.level_type == LevelType::Overlapping as i32
                 || level.total_file_size > self.config.sub_level_max_compaction_bytes
             {
@@ -257,7 +257,8 @@ impl TierCompactionPicker {
             level_handlers[0].add_pending_task(self.compact_task_id, &select_tables);
             level_handlers[0].add_pending_task(self.compact_task_id, &target_tables);
             let mut input_levels = vec![];
-            if idx + 2 < l0.sub_levels.len()
+            if target_tables.is_empty()
+                && idx + 2 < l0.sub_levels.len()
                 && l0.sub_levels[idx + 2].level_type == LevelType::Nonoverlapping as i32
             {
                 let higher_overlap_files = self
@@ -324,10 +325,18 @@ impl CompactionPicker for TierCompactionPicker {
             return Some(input);
         }
 
-        if let Some(input) = self.pick_one_table(l0, level_handlers) {
+        if let Some(input) = self.pick_sharding_level(l0, &mut level_handlers[0]) {
             return Some(input);
         }
-        self.pick_sharding_level(l0, &mut level_handlers[0])
+
+        if l0.sub_levels.len() < self.config.level0_tier_compact_file_number as usize
+            || l0.sub_levels[0].total_file_size < self.config.sub_level_max_compaction_bytes
+        {
+            if let Some(input) = self.pick_one_table(l0, level_handlers) {
+                return Some(input);
+            }
+        }
+        None
     }
 }
 

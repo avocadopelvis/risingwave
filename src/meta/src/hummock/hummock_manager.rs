@@ -694,11 +694,9 @@ where
         if let Some(mut task) = task {
             if CompactStatus::is_trival_move_task(&task) {
                 task.task_status = true;
-                task.sorted_output_ssts = task.input_ssts[1].table_infos.clone();
-                if self.report_compact_task(&task).await.is_err() {
-                    tracing::warn!("report trival move compact task failed.");
-                }
-                return Ok(None);
+                task.sorted_output_ssts = task.input_ssts[0].table_infos.clone();
+                let ret = self.report_compact_task_impl(&task, false).await?;
+                assert!(ret);
             } else {
                 return Ok(Some(task));
             }
@@ -754,10 +752,18 @@ where
         Ok(())
     }
 
+    pub async fn report_compact_task(&self, compact_task: &CompactTask) -> Result<bool> {
+        self.report_compact_task_impl(compact_task, true).await
+    }
+
     /// `report_compact_task` is retryable. `task_id` in `compact_task` parameter is used as the
     /// idempotency key. Return Ok(false) to indicate the `task_id` is not found, which may have
     /// been processed previously.
-    pub async fn report_compact_task(&self, compact_task: &CompactTask) -> Result<bool> {
+    pub async fn report_compact_task_impl(
+        &self,
+        compact_task: &CompactTask,
+        must_assigned: bool,
+    ) -> Result<bool> {
         let mut compaction_guard = self.compaction.write().await;
         let start_time = Instant::now();
         let compaction = compaction_guard.deref_mut();
@@ -771,13 +777,13 @@ where
         );
         let mut compact_task_assignment =
             VarTransaction::new(&mut compaction.compact_task_assignment);
-        let assignee_context_id = match compact_task_assignment.remove(&compact_task.task_id) {
-            None => {
-                // The task is not found.
-                return Ok(false);
-            }
-            Some(assignment) => assignment.context_id,
-        };
+        let assignee_context_id = compact_task_assignment
+            .remove(&compact_task.task_id)
+            .map(|assignment| assignment.context_id);
+        // The task is not found.
+        if assignee_context_id.is_none() && must_assigned {
+            return Ok(false);
+        }
         compact_status.report_compact_task(compact_task);
         if compact_task.task_status {
             // The compaction task is finished.
@@ -850,7 +856,7 @@ where
 
             commit_multi_var!(
                 self,
-                Some(assignee_context_id),
+                assignee_context_id,
                 compact_status,
                 compact_task_assignment,
                 current_version_id,
@@ -863,7 +869,7 @@ where
             // The compaction task is cancelled.
             commit_multi_var!(
                 self,
-                Some(assignee_context_id),
+                assignee_context_id,
                 compact_status,
                 compact_task_assignment
             )?;

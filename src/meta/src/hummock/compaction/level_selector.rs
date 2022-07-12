@@ -221,7 +221,7 @@ impl DynamicLevelSelector {
             // trigger intra-l0 compaction at first when the number of files is too large.
             let l0_score =
                 idle_file_count as u64 * SCORE_BASE / self.config.level0_tier_compact_file_number;
-            ctx.score_levels.push((l0_score, 0, 0));
+            ctx.score_levels.push((std::cmp::min(l0_score, 300), 0, 0));
             let score = total_size * SCORE_BASE / self.config.max_bytes_for_level_base;
             ctx.score_levels.push((score, 0, ctx.base_level));
         }
@@ -287,23 +287,42 @@ impl LevelSelector for DynamicLevelSelector {
     ) -> Option<CompactionTask> {
         let ctx = self.get_priority_levels(levels, level_handlers);
         if !ctx.score_levels.is_empty() && ctx.score_levels[0].0 > SCORE_BASE {
-            let log_data = ctx
-                .score_levels
+            let mut log_data = levels
+                .levels
                 .iter()
-                .filter(|x| x.0 > 0)
-                .map(|(score, select_level, target_level)| {
+                .filter(|level| !level.table_infos.is_empty())
+                .map(|level| {
                     format!(
-                        "level {}->{}, score: {}",
-                        *select_level, *target_level, *score
+                        "level[{}].total_file_size={}",
+                        level.level_idx, level.total_file_size
                     )
                 })
                 .collect_vec();
+            log_data.extend(
+                levels
+                    .l0
+                    .as_ref()
+                    .unwrap()
+                    .sub_levels
+                    .iter()
+                    .filter(|level| !level.table_infos.is_empty())
+                    .map(|level| {
+                        format!(
+                            "level[{}.{}].total_file_size={}, count={}, is_overlap: {:?}",
+                            level.level_idx,
+                            level.sub_level_id,
+                            level.total_file_size,
+                            level.table_infos.len(),
+                            level.level_type == LevelType::Overlapping as i32,
+                        )
+                    }),
+            );
             if !log_data.is_empty() {
                 tracing::info!(
-                    "{:?}. base_level: {}, level_max_bytes: {:?}",
+                    "{:?}. base_level: {}, scores: {:?}",
                     log_data,
                     ctx.base_level,
-                    ctx.level_max_bytes
+                    ctx.score_levels.iter().filter(|x| x.0 > 0).collect_vec(),
                 );
             }
         }
