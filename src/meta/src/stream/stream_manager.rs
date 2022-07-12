@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ops::AddAssign;
 use std::sync::Arc;
 
 use itertools::Itertools;
@@ -637,10 +638,6 @@ impl<S> GlobalStreamManager<S>
         Ok(())
     }
 
-    async fn resolve_actor_graph(&self, _actors: &HashSet<ActorId>) -> Result<()> {
-        todo!()
-    }
-
     pub async fn migrate_actors(
         &self,
         table_id: &TableId,
@@ -650,6 +647,7 @@ impl<S> GlobalStreamManager<S>
             .fragment_manager
             .select_table_fragments_by_table_id(table_id)
             .await?;
+
         let actor_map = table_fragments.actor_map();
         let mut upstream_map = HashMap::new();
         let mut downstream_map = HashMap::new();
@@ -657,38 +655,57 @@ impl<S> GlobalStreamManager<S>
         // let chain_actor_ids: HashSet<ActorId> =
         // table_fragments.chain_actor_ids().into_iter().collect();
 
-        for (actor_id, stream_actor) in actor_map.clone() {
-            println!(
-                "actor_id {} -> {:?}",
-                actor_id, stream_actor.upstream_actor_id
-            );
-        }
+        let locations = {
+            // List all running worker nodes.
+            let workers = self
+                .cluster_manager
+                .list_worker_node(
+                    WorkerType::ComputeNode,
+                    Some(risingwave_pb::common::worker_node::State::Running),
+                )
+                .await;
 
+            if workers.is_empty() {
+                bail!("no available compute node in the cluster");
+            }
+
+            // Create empty locations.
+            let mut locations = ScheduledLocations::with_workers(workers);
+
+            locations
+        };
+        
         for actor_id in &actor_ids {
             let stream_actor = actor_map.get(actor_id).unwrap();
 
             let upstream_actor_ids = stream_actor
                 .upstream_actor_id
                 .iter()
-                .map(|actor_id| (table_id.clone(), actor_id.clone())).collect_vec();
+                .map(|actor_id| (table_id.clone(), actor_id.clone() as ActorId)).collect_vec();
 
             if !upstream_actor_ids.is_empty() {
-                upstream_map.insert((table_id.clone(), actor_id), upstream_actor_ids.clone());
-
-                for x in upstream_actor_ids {
-                    downstream_map.entry(x).or_insert(vec![]).push((table_id.clone(), actor_id.clone()));
+                for table_actor_id in upstream_actor_ids.clone() {
+                    downstream_map.entry(table_actor_id).or_insert(vec![]).push((table_id.clone(), actor_id.clone() as ActorId));
                 }
+
+                upstream_map.insert((*table_id, *actor_id as ActorId), upstream_actor_ids);
             }
         }
 
-        let indepth_map: HashMap<(TableId, ActorId), i32> = actor_ids.iter().map(|actor_id| ((table_id.clone(), actor_id.clone()), 0)).collect();
-
+        let mut in_degree_map: HashMap<(TableId, ActorId), i32> = actor_ids.iter().map(|actor_id| ((table_id.clone(), actor_id.clone()), 0)).collect();
         for actor_id in &actor_ids {
-            let x = downstream_map.get(&(*table_id, *actor_id)).unwrap();
-            // fill the indepth map
+            if let Some(downstream_actors) = downstream_map.get(&(*table_id, *actor_id)) {
+                for downstream_actor in downstream_actors {
+                    in_degree_map.entry(*downstream_actor).or_insert(0).add_assign(1);
+                }
+            }
         }
+        let roots = in_degree_map.into_iter().filter(|(_, b)| { *b == 0 }).map(|(a, _)| a).collect_vec();
 
-        let roots = indepth_map.into_iter().filter(|(_, b)| { *b == 0 }).map(|(a, _)| a).collect_vec();
+        let root_upstreams = roots.iter().map(|root| upstream_map.get(root).unwrap()).collect_vec();
+
+//        locations.actor_locations
+        
 
         println!("roots {:?}", roots);
 
@@ -749,6 +766,7 @@ impl<S> GlobalStreamManager<S>
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, HashMap, HashSet};
+    use std::iter::Filter;
     use std::net::SocketAddr;
     use std::sync::{Arc, Mutex};
     use std::thread::sleep;
@@ -779,7 +797,7 @@ mod tests {
     use crate::hummock::compaction_group::manager::CompactionGroupManager;
     use crate::hummock::{CompactorManager, HummockManager};
     use crate::manager::{CatalogManager, MetaSrvEnv};
-    use crate::model::ActorId;
+    use crate::model::{ActorId, FragmentId};
     use crate::rpc::metrics::MetaMetrics;
     use crate::storage::MemStore;
     use crate::stream::{FragmentManager, SourceManager};
@@ -1030,6 +1048,28 @@ mod tests {
             .collect_vec()
     }
 
+    //                 let body = NodeBody::Materialize(MaterializeNode {
+//                     table_id: table_id.table_id(),
+//                     ..Default::default()
+//                 });
+    fn make_mview_stream_actors_custom(start: usize, stop: usize, node_body: NodeBody, operator_id: u64, upstream_actor_id: Option<Vec<u32>>) -> Vec<StreamActor> {
+        (start..stop)
+            .map(|i| {
+                StreamActor {
+                    actor_id: i as u32,
+                    upstream_actor_id: upstream_actor_id.clone().unwrap_or_default(),
+                    nodes: Some(StreamNode {
+                        node_body: Some(node_body.clone()),
+                        operator_id,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }
+            })
+            .collect_vec()
+    }
+
+
     #[tokio::test(flavor = "multi_thread")]
     async fn test_create_materialized_view() -> Result<()> {
         let services = MockServices::start("127.0.0.1", 12333).await?;
@@ -1111,60 +1151,38 @@ mod tests {
         let services = MockServices::start("127.0.0.1", 12333).await?;
 
         let table_id = TableId::new(0);
-        let upstream_actors = (0..3)
-            .map(|i| StreamActor {
-                actor_id: i as u32,
-                // A dummy node to avoid panic.
-                nodes: Some(StreamNode {
-                    node_body: Some(NodeBody::Source(SourceNode {
-                        table_id: table_id.table_id(),
-                        ..Default::default()
-                    })),
-                    operator_id: 1,
-                    ..Default::default()
-                }),
-                ..Default::default()
-            })
-            .collect_vec();
 
-        let downstream_actors = (3..5)
-            .map(|i| StreamActor {
-                upstream_actor_id: vec![0, 1, 2],
-                actor_id: i as u32,
-                // A dummy node to avoid panic.
-                nodes: Some(StreamNode {
-                    node_body: Some(NodeBody::Materialize(MaterializeNode {
-                        table_id: table_id.table_id(),
-                        ..Default::default()
-                    })),
-                    operator_id: 2,
-                    ..Default::default()
-                }),
-                ..Default::default()
-            })
-            .collect_vec();
+        let actor_groups = vec![
+            make_mview_stream_actors_custom(0, 2, NodeBody::Source(SourceNode { table_id: table_id.table_id(), ..Default::default() }), 0, None),
+            make_mview_stream_actors_custom(2, 5, NodeBody::Filter(FilterNode { ..Default::default() }), 0, Some(vec![0, 1])),
+            make_mview_stream_actors_custom(5, 9, NodeBody::Filter(FilterNode { ..Default::default() }), 0, Some(vec![2, 3, 4])),
+            make_mview_stream_actors_custom(9, 11, NodeBody::Filter(FilterNode { ..Default::default() }), 0, Some(vec![5, 6, 7, 8])),
+            make_mview_stream_actors_custom(11, 12, NodeBody::Materialize(MaterializeNode { table_id: table_id.table_id(), ..Default::default() }), 0, Some(vec![9, 10])),
+        ];
 
         let mut fragments = BTreeMap::default();
-        fragments.insert(
-            0,
-            Fragment {
-                fragment_id: 0,
-                fragment_type: FragmentType::Source as i32,
+
+
+        let actor_groups_len = actor_groups.len();
+        for (i, actor_group) in actor_groups.into_iter().enumerate() {
+            let fragment_type = if i == 0 {
+                FragmentType::Source
+            } else if i == actor_groups_len - 1 {
+                FragmentType::Sink
+            } else {
+                FragmentType::Others
+            };
+            let fragment = Fragment {
+                fragment_id: i as u32,
+                fragment_type: fragment_type as i32,
                 distribution_type: FragmentDistributionType::Hash as i32,
-                actors: upstream_actors.clone(),
+                actors: actor_group.clone(),
                 vnode_mapping: None,
-            },
-        );
-        fragments.insert(
-            1,
-            Fragment {
-                fragment_id: 1,
-                fragment_type: FragmentType::Sink as i32,
-                distribution_type: FragmentDistributionType::Hash as i32,
-                actors: downstream_actors.clone(),
-                vnode_mapping: None,
-            },
-        );
+            };
+
+            fragments.insert(i as FragmentId, fragment);
+        }
+
         let table_fragments = TableFragments::new(table_id, fragments, HashSet::default());
 
         let mut ctx = CreateMaterializedViewContext::default();
@@ -1174,56 +1192,11 @@ mod tests {
             .create_materialized_view(table_fragments, &mut ctx)
             .await?;
 
-        for actor in upstream_actors {
-            let mut scheduled_actor = services
-                .state
-                .actor_streams
-                .lock()
-                .unwrap()
-                .get(&actor.get_actor_id())
-                .cloned()
-                .unwrap()
-                .clone();
-            scheduled_actor.vnode_bitmap.take().unwrap();
-            assert_eq!(scheduled_actor, actor);
-            assert!(services
-                .state
-                .actor_ids
-                .lock()
-                .unwrap()
-                .contains(&actor.get_actor_id()));
-            assert_eq!(
-                services
-                    .state
-                    .actor_infos
-                    .lock()
-                    .unwrap()
-                    .get(&actor.get_actor_id())
-                    .cloned()
-                    .unwrap(),
-                HostAddress {
-                    host: "127.0.0.1".to_string(),
-                    port: 12333,
-                }
-            );
-        }
-
-        // let sink_actor_ids = services
-        //     .fragment_manager
-        //     .get_table_sink_actor_ids(&table_id)
-        //     .await?;
-        // let actor_ids = services
-        //     .fragment_manager
-        //     .get_table_actor_ids(&table_id)
-        //     .await?;
-        // assert_eq!(sink_actor_ids, (0..5).collect::<Vec<u32>>());
-        // assert_eq!(actor_ids, (0..5).collect::<Vec<u32>>());
-
         let mut actors = HashMap::new();
         actors.insert(0, 1);
-        actors.insert(3, 1);
-        actors.insert(4, 1);
-        actors.insert(2, 1);
+        actors.insert(6, 1);
+        actors.insert(8, 1);
+        actors.insert(10, 1);
 
         services
             .global_stream_manager
