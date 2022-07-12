@@ -42,7 +42,7 @@ impl Binder {
         };
         let (mut root_cond, mut root) = self.bind_table_with_joins(first)?;
         for t in from_iter {
-            let (right_expr, right) = self.bind_table_with_joins(t.clone())?;
+            let (right_cond, right) = self.bind_table_with_joins(t.clone())?;
             if let Relation::Subquery(subquery) = &right {
                 if subquery.query.is_correlated() {
                     return Err(ErrorCode::BindError(format!(
@@ -54,7 +54,7 @@ impl Binder {
             }
             root_cond = ExprImpl::FunctionCall(Box::new(FunctionCall::new(
                 ExprType::And,
-                vec![root_cond, right_expr],
+                vec![root_cond, right_cond],
             )?));
             root = Relation::Join(Box::new(BoundJoin {
                 join_type: JoinType::Inner,
@@ -63,7 +63,7 @@ impl Binder {
                 cond: ExprImpl::literal_bool(true),
             }));
         }
-        // The final top-level join should have the root_expr as its condition
+        // The final top-level join should have the root_cond as its condition
         if let Relation::Join(boxed) = &mut root {
             boxed.as_mut().cond = root_cond;
         }
