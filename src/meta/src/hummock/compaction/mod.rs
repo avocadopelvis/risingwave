@@ -149,6 +149,23 @@ impl CompactStatus {
         Some(compact_task)
     }
 
+    pub fn is_trival_move_task(task: &CompactTask) -> bool {
+        if task.input_ssts.len() <= 1 {
+            return true;
+        }
+        if task.input_ssts.len() > 2 {
+            return false;
+        }
+
+        if task.input_ssts[1].level_idx == task.target_level
+            && task.input_ssts[1].table_infos.is_empty()
+        {
+            return true;
+        }
+
+        false
+    }
+
     fn pick_compaction(
         &mut self,
         levels: &Levels,

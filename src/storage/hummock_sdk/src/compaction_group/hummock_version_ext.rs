@@ -169,7 +169,7 @@ impl HummockVersionExt for HummockVersion {
                     level_insert_ssts(&mut levels.levels[insert_sst_level - 1], insert_table_infos);
                 }
             }
-            if insert_sst_level == 0 || delete_sst_levels.iter().any(|level_id| *level_id == 0) {
+            if delete_sst_levels.iter().any(|level_id| *level_id == 0) {
                 levels
                     .l0
                     .as_mut()

@@ -22,7 +22,7 @@ use std::sync::Arc;
 use itertools::Itertools;
 use risingwave_hummock_sdk::HummockCompactionTaskId;
 use risingwave_pb::hummock::hummock_version::Levels;
-use risingwave_pb::hummock::CompactionConfig;
+use risingwave_pb::hummock::{CompactionConfig, LevelType};
 
 use crate::hummock::compaction::compaction_config::CompactionConfigBuilder;
 use crate::hummock::compaction::manual_compaction_picker::ManualCompactionPicker;
@@ -189,21 +189,38 @@ impl DynamicLevelSelector {
     fn get_priority_levels(&self, levels: &Levels, handlers: &mut [LevelHandler]) -> SelectContext {
         let mut ctx = self.calculate_level_base_size(levels);
 
-        let l0_file_count = levels
+        let idle_file_count = levels
             .l0
             .as_ref()
             .unwrap()
             .sub_levels
             .iter()
-            .map(|level| level.table_infos.len())
+            .map(|level| {
+                if level.level_type == LevelType::Nonoverlapping as i32 {
+                    if level
+                        .table_infos
+                        .iter()
+                        .any(|table| handlers[0].is_pending_compact(&table.id))
+                    {
+                        0
+                    } else {
+                        1
+                    }
+                } else {
+                    level
+                        .table_infos
+                        .iter()
+                        .filter(|table| !handlers[0].is_pending_compact(&table.id))
+                        .count()
+                }
+            })
             .sum::<usize>();
-        let idle_file_count = l0_file_count - handlers[0].get_pending_file_count();
         let total_size =
             levels.l0.as_ref().unwrap().total_file_size - handlers[0].get_pending_file_size();
         if total_size > 0 {
             // trigger intra-l0 compaction at first when the number of files is too large.
-            let l0_score = idle_file_count as u64 * SCORE_BASE
-                / (self.config.level0_tier_compact_file_number as u64 * 2);
+            let l0_score =
+                idle_file_count as u64 * SCORE_BASE / self.config.level0_tier_compact_file_number;
             ctx.score_levels.push((l0_score, 0, 0));
             let score = total_size * SCORE_BASE / self.config.max_bytes_for_level_base;
             ctx.score_levels.push((score, 0, ctx.base_level));
@@ -269,6 +286,27 @@ impl LevelSelector for DynamicLevelSelector {
         level_handlers: &mut [LevelHandler],
     ) -> Option<CompactionTask> {
         let ctx = self.get_priority_levels(levels, level_handlers);
+        if !ctx.score_levels.is_empty() && ctx.score_levels[0].0 > SCORE_BASE {
+            let log_data = ctx
+                .score_levels
+                .iter()
+                .filter(|x| x.0 > 0)
+                .map(|(score, select_level, target_level)| {
+                    format!(
+                        "level {}->{}, score: {}",
+                        *select_level, *target_level, *score
+                    )
+                })
+                .collect_vec();
+            if !log_data.is_empty() {
+                tracing::info!(
+                    "{:?}. base_level: {}, level_max_bytes: {:?}",
+                    log_data,
+                    ctx.base_level,
+                    ctx.level_max_bytes
+                );
+            }
+        }
         for (score, select_level, target_level) in ctx.score_levels {
             if score <= SCORE_BASE {
                 return None;

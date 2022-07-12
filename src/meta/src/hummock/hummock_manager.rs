@@ -594,11 +594,10 @@ where
             compaction_group_id,
             manual_compaction_option,
         );
-        tracing::warn!("get_compact_task_impl exist: {}", compact_task.is_some());
-
         let ret = match compact_task {
             None => Ok(None),
             Some(mut compact_task) => {
+                // TODO: deal with trival move
                 let existing_table_ids_from_meta = self
                     .compaction_group_manager
                     .internal_table_ids_by_compaction_group_id(compaction_group_id)
@@ -689,7 +688,22 @@ where
         &self,
         compaction_group_id: CompactionGroupId,
     ) -> Result<Option<CompactTask>> {
-        self.get_compact_task_impl(compaction_group_id, None).await
+        let task = self
+            .get_compact_task_impl(compaction_group_id, None)
+            .await?;
+        if let Some(mut task) = task {
+            if CompactStatus::is_trival_move_task(&task) {
+                task.task_status = true;
+                task.sorted_output_ssts = task.input_ssts[1].table_infos.clone();
+                if self.report_compact_task(&task).await.is_err() {
+                    tracing::warn!("report trival move compact task failed.");
+                }
+                return Ok(None);
+            } else {
+                return Ok(Some(task));
+            }
+        }
+        Ok(None)
     }
 
     pub async fn manual_get_compact_task(
@@ -1332,16 +1346,11 @@ where
                         .flat_map(|(_, l)| &l.levels)
                         .flat_map(|level| {
                             level.table_infos.iter().map(|table_info| {
-                                let info = versioning_guard.sstable_id_infos.get(&table_info.id);
-                                if info.is_none() {
-                                    tracing::error!(
-                                        "sst {} in level {}, sub-level: {} not exist",
-                                        table_info.id,
-                                        level.level_idx,
-                                        level.sub_level_id
-                                    );
-                                }
-                                info.unwrap().clone()
+                                versioning_guard
+                                    .sstable_id_infos
+                                    .get(&table_info.id)
+                                    .unwrap()
+                                    .clone()
                             })
                         })
                         .collect_vec()
