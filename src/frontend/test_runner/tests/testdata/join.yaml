@@ -199,7 +199,7 @@
         BatchScan { table: i, columns: [x] }
         BatchScan { table: i, columns: [x] }
 - sql: |
-    /* Ensure correct binding using ON clause */
+    /* Ensure correct binding with USING clause */
     create table t1(v1 varchar);
     create table t2(v1 varchar);
     create table t3(v2 varchar);
@@ -212,7 +212,7 @@
           LogicalScan { table: t1, columns: [_row_id, v1] }
           LogicalScan { table: t2, columns: [_row_id, v1] }
 - sql: |
-    /* Ensure correct binding using ON clause */
+    /* Ensure correct binding with ON clause */
     create table t1(v1 varchar);
     create table t2(v2 varchar);
     create table t3(v3 varchar);
