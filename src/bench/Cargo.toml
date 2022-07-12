@@ -37,3 +37,7 @@ workspace-hack = { version = "0.1", path = "../workspace-hack" }
 [[bin]]
 name = "ss-bench"
 path = "ss_bench/main.rs"
+
+[[bin]]
+name = "file-cache-bench"
+path = "file_cache_bench/main.rs"
