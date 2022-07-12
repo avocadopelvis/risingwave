@@ -20,7 +20,7 @@ use risingwave_sqlparser::ast::{
 };
 
 use crate::binder::{Binder, Relation};
-use crate::expr::{Expr as _, ExprImpl};
+use crate::expr::{Expr as _, ExprImpl, ExprType, FunctionCall};
 
 #[derive(Debug, Clone)]
 pub struct BoundJoin {
@@ -40,9 +40,9 @@ impl Binder {
             Some(t) => t,
             None => return Ok(None),
         };
-        let mut root = self.bind_table_with_joins(first)?;
+        let (mut root_cond, mut root) = self.bind_table_with_joins(first)?;
         for t in from_iter {
-            let right = self.bind_table_with_joins(t.clone())?;
+            let (right_expr, right) = self.bind_table_with_joins(t.clone())?;
             if let Relation::Subquery(subquery) = &right {
                 if subquery.query.is_correlated() {
                     return Err(ErrorCode::BindError(format!(
@@ -52,6 +52,10 @@ impl Binder {
                     .into());
                 }
             }
+            root_cond = ExprImpl::FunctionCall(Box::new(FunctionCall::new(
+                ExprType::And,
+                vec![root_cond, right_expr],
+            )?));
             root = Relation::Join(Box::new(BoundJoin {
                 join_type: JoinType::Inner,
                 left: root,
@@ -59,11 +63,16 @@ impl Binder {
                 cond: ExprImpl::literal_bool(true),
             }));
         }
+        // The final top-level join should have the root_expr as its condition
+        if let Relation::Join(boxed) = &mut root {
+            boxed.as_mut().cond = root_cond;
+        }
         Ok(Some(root))
     }
 
-    fn bind_table_with_joins(&mut self, table: TableWithJoins) -> Result<Relation> {
+    fn bind_table_with_joins(&mut self, table: TableWithJoins) -> Result<(ExprImpl, Relation)> {
         let mut root = self.bind_table_factor(table.relation)?;
+        let mut root_cond = ExprImpl::literal_bool(true);
         for join in table.joins {
             let (constraint, join_type) = match join.join_operator {
                 JoinOperator::Inner(constraint) => (constraint, JoinType::Inner),
@@ -96,12 +105,17 @@ impl Binder {
                 join_type,
                 left: root,
                 right,
-                cond,
+                cond: ExprImpl::literal_bool(true),
             };
+
+            root_cond = ExprImpl::FunctionCall(Box::new(FunctionCall::new(
+                ExprType::And,
+                vec![root_cond, cond],
+            )?));
             root = Relation::Join(Box::new(join));
         }
 
-        Ok(root)
+        Ok((root_cond, root))
     }
 
     fn bind_join_constraint(
