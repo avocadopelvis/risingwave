@@ -50,6 +50,8 @@ impl TierCompactionPicker {
         l0: &OverlappingLevel,
         level_handler: &mut LevelHandler,
     ) -> Option<CompactionInput> {
+        let level0_tier_compact_file_number = std::cmp::max(1, l0.sub_levels.len() / 100)
+            * self.config.level0_tier_compact_file_number as usize;
         for (idx, level) in l0.sub_levels.iter().enumerate() {
             if level.level_type == LevelType::Nonoverlapping as i32 {
                 continue;
@@ -103,7 +105,7 @@ impl TierCompactionPicker {
                 .iter()
                 .map(|level| level.table_infos.len())
                 .sum::<usize>()
-                < self.config.level0_tier_compact_file_number as usize
+                < level0_tier_compact_file_number
             {
                 continue;
             }
@@ -152,7 +154,7 @@ impl TierCompactionPicker {
             }];
             let max_compaction_bytes = std::cmp::min(
                 self.config.max_compaction_bytes,
-                self.config.sub_level_max_compaction_bytes,
+                self.config.max_bytes_for_level_base,
             );
 
             for other in &l0.sub_levels[idx + 1..] {
